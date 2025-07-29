@@ -14,7 +14,8 @@ import { api, updateTokenStatus } from "../lib/api";
 import {
     useEventSource,
     QueueUpdateData,
-    TokenCalledData,
+    TokenData,
+    QueueItem,
 } from "../hooks/useEventSource";
 
 interface QueueDisplayProps {
@@ -22,19 +23,20 @@ interface QueueDisplayProps {
     doctors: Doctor[];
 }
 
-interface QueueItem {
-    tokenId: string;
-    tokenValue: string;
-    priority: "NORMAL" | "HIGH" | "EMERGENCY";
-    departmentId: string;
-    score: number;
-    rank: number;
-    patientName?: string;
-}
 
-type QueueState = Omit<QueueUpdateData, "queue"> & {
-    queue: QueueItem[];
-};
+
+interface QueueState {
+    departmentId: string;
+    departmentName: string;
+    doctorId: string;
+    doctorName: string;
+    queue: Array<QueueItem & { departmentId?: string }>;
+    active?: QueueItem | null;
+    previous?: QueueItem | null;
+    waiting?: QueueItem[];
+    totalPatients?: number;
+    timestamp?: string;
+}
 
 export const QueueDisplay: React.FC<QueueDisplayProps> = ({
     departments,
@@ -56,7 +58,7 @@ export const QueueDisplay: React.FC<QueueDisplayProps> = ({
         >
     >({});
     const [lastCalledToken, setLastCalledToken] =
-        useState<TokenCalledData | null>(null);
+        useState<TokenData | null>(null);
     const [isUpdating, setIsUpdating] = useState(false);
 
     // Update current time every second
@@ -177,7 +179,7 @@ export const QueueDisplay: React.FC<QueueDisplayProps> = ({
         }
     };
 
-    const handleTokenCalled = useCallback((data: TokenCalledData) => {
+    const handleTokenCalled = useCallback((data: TokenData) => {
         console.log("[Token Called] Event received:", data);
         setLastCalledToken(data);
     }, []);
@@ -267,7 +269,10 @@ export const QueueDisplay: React.FC<QueueDisplayProps> = ({
                 departmentName: queue.departmentName || "Unknown Department",
                 doctorId: queue.doctorId,
                 doctorName: queue.doctorName || "Unknown Doctor",
-                queue: queue.queue || [],
+                queue: (queue.queue || []).map(item => ({
+                    ...item,
+                    departmentId: queue.departmentId
+                })),
             }));
 
             setWaitingQueues(transformedData);

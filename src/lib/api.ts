@@ -30,6 +30,13 @@ export async function fetchQueueStatus(params: QueueStatusParams = {}) {
   return api<any>(`/queue${query ? `?${query}` : ""}`);
 }
 
+export async function updateTokenPriority(tokenId: string, action: 'increase' | 'decrease') {
+  return api<any>(`/tokens`, {
+    method: 'PATCH',
+    body: JSON.stringify({ tokenId, action }),
+  });
+}
+
 export async function updateTokenStatus(tokenId: string, status: string, doctorId?: string) {
   console.log("Updating token status for tokenId:", tokenId);
   

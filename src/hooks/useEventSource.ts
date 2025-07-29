@@ -1,229 +1,223 @@
 import { useEffect, useRef, useCallback } from 'react';
 
+// Type definitions (keep these as they are)
+export type TokenStatus = "CHECKED_IN" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+export type TokenPriority = "NORMAL" | "HIGH" | "EMERGENCY";
+
+export interface QueueItem {
+  tokenId: string;
+  tokenValue: string;
+  priority: TokenPriority;
+  patientId: string;
+  patientName: string;
+  scheduledDate: string;
+  status: TokenStatus;
+  score: number;
+  rank: number;
+}
+
 export interface QueueUpdateData {
   departmentId: string;
   doctorId: string;
-  queue: Array<{
-    tokenId: string;
-    tokenValue: string;
-    priority: "NORMAL" | "HIGH" | "EMERGENCY";
-    departmentId: string;
-    doctorId: string;
-    patientId: string;
-    patientName: string;
-    score: number;
-    rank: number;
-    status?: 'PENDING' | 'CALLED' | 'COMPLETED' | 'CANCELLED';
-  }>;
   departmentName?: string;
   doctorName?: string;
+  queue: Array<QueueItem>;
+  active: QueueItem | null;
+  previous: QueueItem | null;
+  waiting: Array<QueueItem>;
+  totalPatients: number;
+  timestamp: string; // ISO 8601 string
 }
 
-export interface TokenCalledData {
+export interface TokenData {
   tokenId: string;
   tokenValue: string;
   departmentId: string;
   doctorId: string;
-  status: 'CALLED';
+  patientName: string;
+  priority: TokenPriority;
+  status: TokenStatus;
 }
-
-export interface TokenCompletedData {
-  tokenId: string;
-  tokenValue: string;
-  departmentId: string;
-  doctorId: string;
-  status: 'COMPLETED';
-}
-
-export interface TokenCancelledData {
-  tokenId: string;
-  tokenValue: string;
-  departmentId: string;
-  doctorId: string;
-  status: 'CANCELLED';
-}
-
 interface UseEventSourceProps {
-  departmentId: string;
-  doctorId: string;
+  departmentId?: string | null;
+  doctorId?: string | null;
   onMessage: (data: QueueUpdateData) => void;
-  onTokenCalled?: (data: TokenCalledData) => void;
-  onTokenCompleted?: (data: TokenCompletedData) => void;
-  onTokenCancelled?: (data: TokenCancelledData) => void;
   onError?: (error: Event) => void;
-  onOpen?: () => void;
+  onOpen?: () => void; // For initial successful connection
+  onReconnect?: () => void; // NEW: For successful reconnections after an error
+  reconnectOnClose?: boolean;
 }
 
-export const useEventSource = ({ 
-  departmentId, 
-  doctorId, 
-  onMessage, 
-  onTokenCalled,
-  onTokenCompleted,
-  onTokenCancelled,
-  onError, 
-  onOpen 
+export const useEventSource = ({
+  departmentId,
+  doctorId,
+  onMessage,
+  onError,
+  onOpen,
+  onReconnect,
+  reconnectOnClose = true
 }: UseEventSourceProps) => {
   const eventSource = useRef<EventSource | null>(null);
   const reconnectAttempts = useRef(0);
   const reconnectTimeoutRef = useRef<number>();
-  const isMounted = useRef(true);
+  const isInitialConnect = useRef(true);
+  const lastDepartmentId = useRef(departmentId);
+  const lastDoctorId = useRef(doctorId);
+  const hasBothIds = useRef(!!(departmentId && doctorId));
+
+  // Use refs for the callbacks
+  const onMessageRef = useRef(onMessage);
+  const onErrorRef = useRef(onError);
+  const onOpenRef = useRef(onOpen);
+  const onReconnectRef = useRef(onReconnect);
+  const reconnectOnCloseRef = useRef(reconnectOnClose);
+
+  // Update the refs whenever the props change
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+    onErrorRef.current = onError;
+    onOpenRef.current = onOpen;
+    onReconnectRef.current = onReconnect;
+    reconnectOnCloseRef.current = reconnectOnClose;
+  }, [onMessage, onError, onOpen, onReconnect, reconnectOnClose]);
 
   const cleanup = useCallback(() => {
     if (eventSource.current) {
       eventSource.current.close();
       eventSource.current = null;
+      console.log('[SSE] Connection closed.');
     }
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = undefined;
     }
   }, []);
 
-  const connectSSE = useCallback(() => {
-    if (!isMounted.current) return cleanup;
+  const buildSSEUrl = useCallback(() => {
+    const params = new URLSearchParams();
+    if (departmentId) params.append('departmentId', departmentId);
+    if (doctorId) params.append('doctorId', doctorId);
+    return `${import.meta.env.VITE_BASE_URL}/sse/events?${params.toString()}`;
+  }, [departmentId, doctorId]);
 
-    // If either ID is missing, clean up and wait for both to be available
+  const connectSSE = useCallback(() => {
+    // Only connect if we have both departmentId and doctorId
     if (!departmentId || !doctorId) {
-      cleanup();
+      console.log('[SSE] Skipping connection: both departmentId and doctorId are required');
       return;
     }
 
-    // Close any existing connection
+    // Log the base URL being used
+    console.log('[SSE] Using base URL:', import.meta.env.VITE_BASE_URL);
+    if (!import.meta.env.VITE_BASE_URL) {
+      console.error('[SSE] VITE_BASE_URL is not set. Please check your environment variables.');
+      return;
+    }
+
+    // Clean up any existing connection
     cleanup();
 
-    // Reset reconnection attempts when changing department/doctor
+    // Reset reconnection attempts
     reconnectAttempts.current = 0;
 
-    const url = `${import.meta.env.VITE_BASE_URL}/sse/events?department=${departmentId}&doctorId=${doctorId}`;
+    const url = buildSSEUrl();
     console.log(`[SSE] Connecting to: ${url}`);
-    
-    const source = new EventSource(url, { withCredentials: true });
-    eventSource.current = source;
-    
-    console.log('[SSE] EventSource created, readyState:', source.readyState);
 
-    const handleQueueUpdate = (event: MessageEvent) => {
-      if (!isMounted.current) return;
-      
-      try {
-        console.log('[SSE] Received queue_update event:', event);
-        const eventData = JSON.parse(event.data);
-        console.log('[SSE] Parsed queue update data:', eventData);
-        onMessage(eventData);
-        // Reset reconnection attempts on successful message
+    try {
+      const source = new EventSource(url, { withCredentials: true });
+      eventSource.current = source;
+
+      const createEventHandler = <T,>(handlerRef: React.MutableRefObject<((data: T) => void) | undefined>, eventName: string) => 
+        (event: MessageEvent) => {
+          if (!handlerRef.current) return;
+          try {
+            const data = JSON.parse(event.data);
+            console.log(`[SSE] Received ${eventName}:`, data);
+            handlerRef.current(data);
+          } catch (e) {
+            console.error(`[SSE] Error parsing ${eventName} data:`, e, 'Raw data:', event.data);
+          }
+        };
+
+      source.onopen = () => {
+        console.log('[SSE] Connection opened.');
         reconnectAttempts.current = 0;
-      } catch (e) {
-        console.error('[SSE] Error parsing queue update data:', e, 'Raw data:', event.data);
-      }
-    };
-
-    const handleTokenCalled = (event: MessageEvent) => {
-      if (!isMounted.current || !onTokenCalled) return;
-      
-      try {
-        console.log('[SSE] Received token_called event:', event);
-        const tokenData = JSON.parse(event.data);
-        console.log('[SSE] Parsed token called data:', tokenData);
-        onTokenCalled(tokenData);
-        // Reset reconnection attempts on successful message
-        reconnectAttempts.current = 0;
-      } catch (e) {
-        console.error('[SSE] Error parsing token called data:', e, 'Raw data:', event.data);
-      }
-    };
-
-    const handleOpen = () => {
-      console.log('[SSE] Connection opened, readyState:', eventSource.current?.readyState);
-      reconnectAttempts.current = 0;
-      onOpen?.();
-    };
-
-    const handleError = (event: Event) => {
-      if (!isMounted.current) return;
-      
-      console.error('[SSE] Connection error, readyState:', eventSource.current?.readyState, 'Event:', event);
-      onError?.(event);
-      
-      // Close the current connection
-      if (source) {
-        console.log('[SSE] Closing source due to error');
-        source.close();
-      }
-
-      // Exponential backoff for reconnection
-      const timeout = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 30000);
-      reconnectAttempts.current++;
-      
-      console.log(`[SSE] Attempting to reconnect in ${timeout}ms (attempt ${reconnectAttempts.current})`);
-      
-      reconnectTimeoutRef.current = window.setTimeout(() => {
-        if (isMounted.current && departmentId && doctorId) {
-          console.log('[SSE] Executing reconnection attempt', reconnectAttempts.current);
-          connectSSE();
+        if (isInitialConnect.current) {
+          onOpenRef.current?.();
+          isInitialConnect.current = false;
         } else {
-          console.log('[SSE] Not reconnecting - missing departmentId or doctorId or unmounted');
+          onReconnectRef.current?.();
         }
-      }, timeout);
-    };
+      };
 
-    const handleTokenCompleted = (event: MessageEvent) => {
-      if (!isMounted.current || !onTokenCompleted) return;
-      
-      try {
-        console.log('[SSE] Received token_completed event:', event);
-        const tokenData = JSON.parse(event.data);
-        console.log('[SSE] Parsed token completed data:', tokenData);
-        onTokenCompleted(tokenData);
-        reconnectAttempts.current = 0;
-      } catch (e) {
-        console.error('[SSE] Error parsing token completed data:', e, 'Raw data:', event.data);
-      }
-    };
+      source.onerror = (event: Event) => {
+        console.error('[SSE] Connection error:', event);
+        console.error('[SSE] Ready State:', (event.target as EventSource)?.readyState);
+        onErrorRef.current?.(event);
+        
+        // Close the current connection
+        source.close();
+        
+        if (reconnectOnCloseRef.current && reconnectAttempts.current < 5) { // Limit to 5 attempts for now
+          const baseDelay = Math.min(1000 * Math.pow(2, reconnectAttempts.current), 10000); // Max 10s delay
+          const jitter = Math.random() * 1000;
+          const timeout = baseDelay + jitter;
+          
+          reconnectAttempts.current++;
+          console.log(`[SSE] Attempting to reconnect in ${Math.round(timeout)}ms (attempt ${reconnectAttempts.current}/5)`);
+          
+          reconnectTimeoutRef.current = window.setTimeout(() => {
+            if (departmentId && doctorId) {
+              console.log('[SSE] Reconnecting...');
+              connectSSE();
+            }
+          }, timeout);
+        } else if (reconnectAttempts.current >= 5) {
+          const errorMsg = '[SSE] Maximum reconnection attempts reached. Please check if the server is running and accessible.';
+          console.error(errorMsg);
+          alert(errorMsg + '\n\nCheck the console for more details.');
+        }
+      };
 
-    const handleTokenCancelled = (event: MessageEvent) => {
-      if (!isMounted.current || !onTokenCancelled) return;
-      
-      try {
-        console.log('[SSE] Received token_cancelled event:', event);
-        const tokenData = JSON.parse(event.data);
-        console.log('[SSE] Parsed token cancelled data:', tokenData);
-        onTokenCancelled(tokenData);
-        reconnectAttempts.current = 0;
-      } catch (e) {
-        console.error('[SSE] Error parsing token cancelled data:', e, 'Raw data:', event.data);
-      }
-    };
+      // Set up event listeners
+      source.addEventListener('queue_update', createEventHandler(onMessageRef, 'queue_update'));
+      return () => {
+        source.close();
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = undefined;
+        }
+      };
+    } catch (error) {
+      console.error('[SSE] Error creating EventSource:', error);
+    }
+  }, [departmentId, doctorId, buildSSEUrl, cleanup]);
 
-    // Set up event listeners
-    source.addEventListener('queue_update', handleQueueUpdate);
-    source.addEventListener('token_called', handleTokenCalled);
-    source.addEventListener('token_completed', handleTokenCompleted);
-    source.addEventListener('token_cancelled', handleTokenCancelled);
-    source.addEventListener('error', handleError);
-    source.addEventListener('open', handleOpen);
-
-    // Cleanup function
-    return () => {
-      source.removeEventListener('queue_update', handleQueueUpdate);
-      source.removeEventListener('token_called', handleTokenCalled);
-      source.removeEventListener('token_completed', handleTokenCompleted);
-      source.removeEventListener('token_cancelled', handleTokenCancelled);
-      source.removeEventListener('error', handleError);
-      source.removeEventListener('open', handleOpen);
-      source.close();
-    };
-  }, [departmentId, doctorId, onMessage, onError, onOpen, cleanup]);
-
-  // Initialize SSE connection
+  // Main effect to handle connection setup and cleanup
   useEffect(() => {
-    isMounted.current = true;
-    connectSSE();
+    const bothIdsNow = !!(departmentId && doctorId);
+    const idsChanged = departmentId !== lastDepartmentId.current || doctorId !== lastDoctorId.current;
+
+    if (bothIdsNow && (idsChanged || !hasBothIds.current)) {
+      // We have both IDs now (either just got them or they changed)
+      lastDepartmentId.current = departmentId;
+      lastDoctorId.current = doctorId;
+      hasBothIds.current = true;
+      connectSSE();
+    } else if (!bothIdsNow && hasBothIds.current) {
+      // We had both IDs before but now we don't
+      hasBothIds.current = false;
+      cleanup();
+    }
 
     return () => {
-      isMounted.current = false;
-      cleanup();
+      // Only clean up if we're not reconnecting or if we no longer have both IDs
+      if (!reconnectOnCloseRef.current || !hasBothIds.current) {
+        cleanup();
+      }
     };
-  }, [connectSSE, cleanup, departmentId, doctorId]);
+  }, [departmentId, doctorId, connectSSE, cleanup]);
 
-  return { cleanup };
+  // No need to return anything as we're using callbacks
+  return null;
 };
